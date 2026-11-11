@@ -19,12 +19,13 @@ namespace Microsoft.Azure.SignalR
     /// <summary>
     /// Intercepts ASP.NET Core's /refresh endpoint for ASRS-connected hubs and routes it through the Azure SignalR refresh flow.
     /// Detects endpoints carrying both <see cref="AuthenticationRefreshMetadata"/> and <see cref="HubMetadata"/>
+    /// while preserving each mapping's route and metadata.
     /// </summary>
     internal class AuthRefreshMatcherPolicy : MatcherPolicy, IEndpointSelectorPolicy
     {
         private static readonly MethodInfo _createRefreshEndpointCoreMethodInfo = typeof(AuthRefreshMatcherPolicy).GetMethod(nameof(CreateRefreshEndpointCore), BindingFlags.NonPublic | BindingFlags.Static);
 
-        private readonly ConcurrentDictionary<Type, Endpoint> _refreshEndpointCache = new ConcurrentDictionary<Type, Endpoint>();
+        private readonly ConcurrentDictionary<RouteEndpoint, Endpoint> _refreshEndpointCache = new ConcurrentDictionary<RouteEndpoint, Endpoint>();
 
         public override int Order => 1;
 
@@ -56,10 +57,8 @@ namespace Microsoft.Azure.SignalR
                     // Only replace the refresh endpoint, leaving negotiate/connect endpoints untouched.
                     if (refreshMetadata != null && hubMetadata != null)
                     {
-                        if (!_refreshEndpointCache.TryGetValue(hubMetadata.HubType, out var newEndpoint))
-                        {
-                            newEndpoint = _refreshEndpointCache.GetOrAdd(hubMetadata.HubType, CreateRefreshEndpoint(hubMetadata.HubType, routeEndpoint));
-                        }
+                        var newEndpoint = _refreshEndpointCache.GetOrAdd(routeEndpoint,
+                            endpoint => CreateRefreshEndpoint(hubMetadata.HubType, endpoint));
 
                         candidates.ReplaceEndpoint(i, newEndpoint, candidate.Values);
                     }
@@ -69,13 +68,10 @@ namespace Microsoft.Azure.SignalR
             return Task.CompletedTask;
         }
 
-        private Func<Type, Endpoint> CreateRefreshEndpoint(Type hubType, RouteEndpoint routeEndpoint)
+        private static Endpoint CreateRefreshEndpoint(Type hubType, RouteEndpoint routeEndpoint)
         {
             var genericMethodInfo = _createRefreshEndpointCoreMethodInfo.MakeGenericMethod(hubType);
-            return type =>
-            {
-                return (Endpoint)genericMethodInfo.Invoke(this, new object[] { routeEndpoint });
-            };
+            return (Endpoint)genericMethodInfo.Invoke(null, new object[] { routeEndpoint });
         }
 
         private static Endpoint CreateRefreshEndpointCore<THub>(RouteEndpoint routeEndpoint) where THub : Hub

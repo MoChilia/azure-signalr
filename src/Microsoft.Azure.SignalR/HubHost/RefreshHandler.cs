@@ -48,7 +48,7 @@ internal class RefreshHandler<THub> where THub : Hub
             return;
         }
 
-        if (!_negotiateHandler.IsAuthenticationRefreshEnabled)
+        if (!_negotiateHandler.IsAuthenticationRefreshEnabled(context))
         {
             await WriteErrorAsync(context, StatusCodes.Status404NotFound, "refresh_disabled");
             return;
@@ -80,7 +80,7 @@ internal class RefreshHandler<THub> where THub : Hub
         // The endpoint that answers the read is remembered so the refresh below can be pinned to it
         // instead of fanning out to every endpoint a second time.
         HubServiceEndpoint owningEndpoint = null;
-        var callback = _negotiateHandler.AuthenticationRefreshCallback;
+        var callback = _negotiateHandler.GetAuthenticationRefreshCallback(context);
         if (callback != null)
         {
             var (claimsStatus, previousClaims, answeringEndpoint) = await _serviceConnectionManager.GetConnectionClaimsAsync(

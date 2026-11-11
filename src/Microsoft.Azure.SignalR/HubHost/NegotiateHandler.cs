@@ -128,7 +128,7 @@ internal class NegotiateHandler<THub> where THub : Hub
 
         TimeSpan? accessTokenLifetime = null;
 #if NET11_0_OR_GREATER
-        if (_dispatcherOptions.EnableAuthenticationRefresh
+        if (IsAuthenticationRefreshEnabled(context)
             && context.User?.Identity?.IsAuthenticated == true
             && !HasWindowsIdentity(context.User))
         {
@@ -205,7 +205,7 @@ internal class NegotiateHandler<THub> where THub : Hub
         var expiration = authResultFeature?.AuthenticateResult?.Succeeded == true
             ? authResultFeature.AuthenticateResult.Properties.ExpiresUtc
             : null;
-        if (_dispatcherOptions.MaximumAuthenticationExpiration is not { } maximum)
+        if (GetDispatcherOptions(context).MaximumAuthenticationExpiration is not { } maximum)
         {
             return expiration;
         }
@@ -233,10 +233,10 @@ internal class NegotiateHandler<THub> where THub : Hub
         return false;
     }
 
-    internal bool IsAuthenticationRefreshEnabled => _dispatcherOptions.EnableAuthenticationRefresh;
+    internal bool IsAuthenticationRefreshEnabled(HttpContext context) => GetDispatcherOptions(context).EnableAuthenticationRefresh;
 
-
-    internal Func<AuthenticationRefreshContext, Task<bool>> AuthenticationRefreshCallback => _dispatcherOptions.OnAuthenticationRefresh;
+    internal Func<AuthenticationRefreshContext, Task<bool>> GetAuthenticationRefreshCallback(HttpContext context) =>
+        GetDispatcherOptions(context).OnAuthenticationRefresh;
 
     internal Claim[] BuildRefreshClaims(HttpContext context) => BuildClaims(context).ToArray();
 
@@ -274,12 +274,13 @@ internal class NegotiateHandler<THub> where THub : Hub
         var closeOnAuthenticationExpiration = false;
         var authenticationExpiresOn = default(DateTimeOffset?);
 #if NET6_0_OR_GREATER
-        closeOnAuthenticationExpiration = _dispatcherOptions.CloseOnAuthenticationExpiration;
+        var dispatcherOptions = GetDispatcherOptions(context);
+        closeOnAuthenticationExpiration = dispatcherOptions.CloseOnAuthenticationExpiration;
         var authResultFeature = context.Features.Get<IAuthenticateResultFeature>();
         if (authResultFeature != null && authResultFeature.AuthenticateResult != null && authResultFeature.AuthenticateResult.Succeeded)
         {
 #if NET11_0_OR_GREATER
-            authenticationExpiresOn = _dispatcherOptions.EnableAuthenticationRefresh
+            authenticationExpiresOn = dispatcherOptions.EnableAuthenticationRefresh
                 ? GetAuthenticationExpiresOn(context)
                 : authResultFeature.AuthenticateResult.Properties.ExpiresUtc;
 #else
@@ -346,6 +347,12 @@ internal class NegotiateHandler<THub> where THub : Hub
     }
 
 #if NET6_0_OR_GREATER
+    private HttpConnectionDispatcherOptions GetDispatcherOptions(HttpContext context)
+    {
+        // Calls without a routed endpoint retain the existing per-hub defaults.
+        return context.GetEndpoint()?.Metadata.GetMetadata<HttpConnectionDispatcherOptions>() ?? _dispatcherOptions;
+    }
+
     private static HttpConnectionDispatcherOptions GetDispatcherOptions(EndpointDataSource source, Type hubType)
     {
         foreach (var endpoint in source.Endpoints)

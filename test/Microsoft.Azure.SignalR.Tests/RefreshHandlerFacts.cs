@@ -14,10 +14,14 @@ using System.Threading.Tasks;
 using Azure;
 
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Azure.SignalR.Protocol;
 using Microsoft.Azure.SignalR.Tests.Common;
@@ -33,6 +37,116 @@ namespace Microsoft.Azure.SignalR.Tests;
 public class RefreshHandlerFacts
 {
     private const string ConnectionString = "Endpoint=http://localhost;Port=8080;AccessKey=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGH;Version=1.0;";
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RefreshMatcherPolicy_MultipleMappings_PreservesRouteMetadata(bool reverseOrder)
+    {
+        await using var fixture = await CreateFixtureAsync(configureEndpoints: app =>
+            app.MapHub<TestHub>("/other", options => options.EnableAuthenticationRefresh = true)
+                .RequireAuthorization("OtherPolicy"));
+        var endpoints = new[] { fixture.GetEndpoint("/hub/refresh"), fixture.GetEndpoint("/other/refresh") };
+        if (reverseOrder)
+        {
+            Array.Reverse(endpoints);
+        }
+        var policy = new AuthRefreshMatcherPolicy();
+        var replacements = new Endpoint[endpoints.Length];
+
+        for (var pass = 0; pass < 2; pass++)
+        {
+            for (var i = 0; i < endpoints.Length; i++)
+            {
+                var original = endpoints[i];
+                var candidates = new CandidateSet(new Endpoint[] { original }, new[] { new RouteValueDictionary() }, new[] { 0 });
+
+                await policy.ApplyAsync(new DefaultHttpContext(), candidates);
+
+                var replacement = Assert.IsType<RouteEndpoint>(candidates[0].Endpoint);
+                Assert.Equal(original.RoutePattern.RawText, replacement.RoutePattern.RawText);
+                Assert.Equal(original.Metadata.ToArray(), replacement.Metadata.ToArray());
+                Assert.Same(original.Metadata.GetMetadata<HttpConnectionDispatcherOptions>(),
+                    replacement.Metadata.GetMetadata<HttpConnectionDispatcherOptions>());
+                Assert.Equal(original.Metadata.GetMetadata<IAuthorizeData>()?.Policy,
+                    replacement.Metadata.GetMetadata<IAuthorizeData>()?.Policy);
+                if (pass == 0)
+                {
+                    replacements[i] = replacement;
+                }
+                else
+                {
+                    Assert.Same(replacements[i], replacement);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ProcessAsync_MultipleMappings_UsesRouteSpecificRefreshOptions()
+    {
+        var rejectedCallbackCount = 0;
+        var acceptedCallbackCount = 0;
+        var manager = new FakeServiceConnectionManager<TestHub>();
+        await using var fixture = await CreateFixtureAsync(
+            callback: _ =>
+            {
+                rejectedCallbackCount++;
+                return Task.FromResult(false);
+            },
+            manager: manager,
+            configureEndpoints: app =>
+            {
+                app.MapHub<TestHub>("/other", options =>
+                {
+                    options.EnableAuthenticationRefresh = true;
+                    options.CloseOnAuthenticationExpiration = true;
+                    options.MaximumAuthenticationExpiration = TimeSpan.FromMinutes(5);
+                    options.OnAuthenticationRefresh = _ =>
+                    {
+                        acceptedCallbackCount++;
+                        return Task.FromResult(true);
+                    };
+                });
+                app.MapHub<TestHub>("/disabled", options => options.EnableAuthenticationRefresh = false);
+            });
+        manager.RefreshResult = new RefreshAuthResult(
+            AckStatus.Ok, new[] { new Claim("tenant", "runtime-tenant") }, fixture.Endpoint);
+        var acceptedContext = CreateContext(fixture.GetEndpoint("/other/refresh"));
+        acceptedContext.Features.Set(Mock.Of<IAuthenticateResultFeature>(feature =>
+            feature.AuthenticateResult == AuthenticateResult.Success(new AuthenticationTicket(
+                acceptedContext.User, new AuthenticationProperties { ExpiresUtc = DateTimeOffset.UtcNow.AddHours(1) }, "TestAuth"))));
+        var beforeRefresh = DateTimeOffset.UtcNow;
+
+        await fixture.Handler.ProcessAsync(acceptedContext);
+
+        Assert.Equal(StatusCodes.Status200OK, acceptedContext.Response.StatusCode);
+        Assert.Equal(1, acceptedCallbackCount);
+        Assert.Equal(0, rejectedCallbackCount);
+        Assert.Equal(1, manager.RefreshCallCount);
+        Assert.InRange(manager.RefreshMessage.ExpireTime, beforeRefresh.AddMinutes(5), DateTimeOffset.UtcNow.AddMinutes(5));
+        Assert.Equal("true", Assert.Single(manager.RefreshMessage.Claims, claim => claim.Type == Constants.ClaimType.CloseOnAuthExpiration).Value);
+        var claimExpiration = ClaimsUtility.GetAuthenticationExpiration(manager.RefreshMessage.Claims);
+        Assert.NotNull(claimExpiration);
+        Assert.InRange(claimExpiration.Value, beforeRefresh.AddMinutes(5).AddSeconds(-1), DateTimeOffset.UtcNow.AddMinutes(5));
+
+        var rejectedContext = CreateContext(fixture.GetEndpoint("/hub/refresh"));
+        await fixture.Handler.ProcessAsync(rejectedContext);
+
+        Assert.Equal(StatusCodes.Status403Forbidden, rejectedContext.Response.StatusCode);
+        Assert.Equal("permission_change_rejected", await ReadErrorAsync(rejectedContext));
+        Assert.Equal(1, rejectedCallbackCount);
+        Assert.Equal(1, acceptedCallbackCount);
+        Assert.Equal(1, manager.RefreshCallCount);
+
+        var disabledContext = CreateContext(fixture.GetEndpoint("/disabled/negotiate"));
+        await fixture.Handler.ProcessAsync(disabledContext);
+
+        Assert.Equal(StatusCodes.Status404NotFound, disabledContext.Response.StatusCode);
+        Assert.Equal("refresh_disabled", await ReadErrorAsync(disabledContext));
+        Assert.Equal(2, manager.GetClaimsCallCount);
+        Assert.Equal(1, manager.RefreshCallCount);
+    }
 
     [Theory]
     [InlineData(true)]
@@ -282,7 +396,8 @@ public class RefreshHandlerFacts
     private static async Task<Fixture> CreateFixtureAsync(
         Func<AuthenticationRefreshContext, Task<bool>> callback = null,
         FakeServiceConnectionManager<TestHub> manager = null,
-        IServiceEndpointManager endpointManager = null)
+        IServiceEndpointManager endpointManager = null,
+        Action<WebApplication> configureEndpoints = null)
     {
         manager ??= new FakeServiceConnectionManager<TestHub>();
         var builder = WebApplication.CreateBuilder();
@@ -300,12 +415,13 @@ public class RefreshHandlerFacts
             options.EnableAuthenticationRefresh = true;
             options.OnAuthenticationRefresh = callback;
         });
+        configureEndpoints?.Invoke(app);
         await app.StartAsync();
         var endpoint = app.Services.GetRequiredService<IServiceEndpointManager>().GetEndpoints(nameof(TestHub)).Single();
         return new Fixture(app, app.Services.GetRequiredService<RefreshHandler<TestHub>>(), manager, endpoint);
     }
 
-    private static DefaultHttpContext CreateContext()
+    private static DefaultHttpContext CreateContext(Endpoint endpoint = null)
     {
         var context = new DefaultHttpContext();
         context.Request.Method = HttpMethods.Post;
@@ -314,6 +430,7 @@ public class RefreshHandlerFacts
         context.User = new ClaimsPrincipal(new ClaimsIdentity(
             new[] { new Claim(ClaimTypes.NameIdentifier, "alice"), new Claim("tenant", "fabrikam") },
             "TestAuth"));
+        context.SetEndpoint(endpoint);
         return context;
     }
 
@@ -345,6 +462,10 @@ public class RefreshHandlerFacts
         public FakeServiceConnectionManager<TestHub> Manager { get; }
 
         public HubServiceEndpoint Endpoint { get; }
+
+        public RouteEndpoint GetEndpoint(string path) =>
+            ((IEndpointRouteBuilder)_app).DataSources.SelectMany(source => source.Endpoints)
+                .OfType<RouteEndpoint>().Single(endpoint => endpoint.RoutePattern.RawText == path);
 
         public ValueTask DisposeAsync() => _app.DisposeAsync();
     }

@@ -19,6 +19,8 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Localization;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Azure.SignalR.Common;
 using Microsoft.Azure.SignalR.Tests.Common;
@@ -623,6 +625,59 @@ public class NegotiateHandlerFacts
 #endif
 
 #if NET11_0_OR_GREATER
+
+    [Fact]
+    public async Task TestNegotiateHandlerMultipleMappingsUseRouteSpecificOptions()
+    {
+        using var app = await CreateSignalRServerAppWithAuthenticationRefreshAsync(false, TimeSpan.FromDays(1));
+        app.MapHub<Chat>("/other", options =>
+        {
+            options.EnableAuthenticationRefresh = true;
+            options.CloseOnAuthenticationExpiration = true;
+            options.MaximumAuthenticationExpiration = TimeSpan.FromMinutes(5);
+        });
+        var handler = app.Services.GetRequiredService<NegotiateHandler<Chat>>();
+        var policy = new NegotiateMatcherPolicy();
+
+        foreach (var path in new[] { "/other/negotiate", "/chat/negotiate", "/other/negotiate" })
+        {
+            var principal = new ClaimsPrincipal(new ClaimsIdentity(
+                new[] { new Claim(ClaimTypes.NameIdentifier, DefaultUserId) }, "TestAuth"));
+            var context = new DefaultHttpContext { User = principal };
+            context.Request.Path = path;
+            var originalEndpoint = ((IEndpointRouteBuilder)app).DataSources.SelectMany(source => source.Endpoints)
+                .OfType<RouteEndpoint>().Single(endpoint => endpoint.RoutePattern.RawText == path);
+            var candidates = new CandidateSet(new Endpoint[] { originalEndpoint }, new[] { new RouteValueDictionary() }, new[] { 0 });
+            await policy.ApplyAsync(context, candidates);
+            var endpoint = Assert.IsType<RouteEndpoint>(candidates[0].Endpoint);
+            Assert.Equal(originalEndpoint.RoutePattern.RawText, endpoint.RoutePattern.RawText);
+            Assert.Equal(originalEndpoint.Metadata.ToArray(), endpoint.Metadata.ToArray());
+            context.SetEndpoint(endpoint);
+            context.Features.Set(Mock.Of<IAuthenticateResultFeature>(feature =>
+                feature.AuthenticateResult == AuthenticateResult.Success(new AuthenticationTicket(
+                    principal, new AuthenticationProperties { ExpiresUtc = DateTimeOffset.UtcNow.AddHours(1) }, "TestAuth"))));
+
+            var response = await handler.Process(context);
+            var token = JwtSecurityTokenHandler.ReadJwtToken(response.AccessToken);
+            if (path == "/other/negotiate")
+            {
+                Assert.NotNull(response.TokenLifetime);
+                Assert.InRange(response.TokenLifetime.Value, TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(5), TimeSpan.FromMinutes(5));
+                Assert.Contains(token.Claims, claim => claim.Type == Constants.ClaimType.CloseOnAuthExpiration);
+                var expiration = DateTimeOffset.FromUnixTimeSeconds(long.Parse(
+                    Assert.Single(token.Claims, claim => claim.Type == Constants.ClaimType.AuthExpiresOn).Value, CultureInfo.InvariantCulture));
+                Assert.InRange(expiration - DateTimeOffset.UtcNow, TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(5), TimeSpan.FromMinutes(5));
+            }
+            else
+            {
+                Assert.Null(response.TokenLifetime);
+                Assert.DoesNotContain(token.Claims, claim => claim.Type == Constants.ClaimType.CloseOnAuthExpiration);
+                Assert.InRange(token.ValidTo - token.ValidFrom, TimeSpan.FromDays(1) - TimeSpan.FromSeconds(1), TimeSpan.FromDays(1) + TimeSpan.FromSeconds(1));
+            }
+        }
+
+        await app.StopAsync();
+    }
 
     [Theory]
     [InlineData(true)]

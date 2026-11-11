@@ -20,8 +20,8 @@ namespace Microsoft.Azure.SignalR
     {
         private static readonly MethodInfo _createNegotiateEndpointCoreMethodInfo = typeof(NegotiateMatcherPolicy).GetMethod(nameof(CreateNegotiateEndpointCore), BindingFlags.NonPublic | BindingFlags.Static);
         
-        // This caches the replacement endpoints for negotiate so they are not recomputed on every request
-        private readonly ConcurrentDictionary<Type, Endpoint> _negotiateEndpointCache = new ConcurrentDictionary<Type, Endpoint>();
+        // Cache by endpoint to preserve the route and metadata of each mapping.
+        private readonly ConcurrentDictionary<RouteEndpoint, Endpoint> _negotiateEndpointCache = new ConcurrentDictionary<RouteEndpoint, Endpoint>();
 
         public override int Order => 1;
 
@@ -53,7 +53,8 @@ namespace Microsoft.Azure.SignalR
                     // skip endpoint not apply hub.
                     if (hubMetadata != null)
                     {
-                        var newEndpoint = _negotiateEndpointCache.GetOrAdd(hubMetadata.HubType, CreateNegotiateEndpoint(hubMetadata.HubType, routeEndpoint));
+                        var newEndpoint = _negotiateEndpointCache.GetOrAdd(routeEndpoint,
+                            endpoint => CreateNegotiateEndpoint(hubMetadata.HubType, endpoint));
 
                         candidates.ReplaceEndpoint(i, newEndpoint, candidate.Values);
                     }
@@ -63,13 +64,10 @@ namespace Microsoft.Azure.SignalR
             return Task.CompletedTask;
         }
 
-        private Func<Type, Endpoint> CreateNegotiateEndpoint(Type hubType, RouteEndpoint routeEndpoint)
+        private static Endpoint CreateNegotiateEndpoint(Type hubType, RouteEndpoint routeEndpoint)
         {
             var genericMethodInfo = _createNegotiateEndpointCoreMethodInfo.MakeGenericMethod(hubType);
-            return type =>
-            {
-                return (Endpoint)genericMethodInfo.Invoke(this, new object[] { routeEndpoint });
-            };
+            return (Endpoint)genericMethodInfo.Invoke(null, new object[] { routeEndpoint });
         }
 
         private static Endpoint CreateNegotiateEndpointCore<THub>(RouteEndpoint routeEndpoint) where THub : Hub
